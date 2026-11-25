@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Night Shift · a two-player balancing game</title>
+<style>
+  * { box-sizing: border-box; }
+  :root { color-scheme: dark; font: 16px/1.4 "Instrument Sans", "Segoe UI", sans-serif; background: #081523; color: #eaf4f5; }
+  body { margin: 0; min-height: 100svh; display: grid; place-items: center; padding: 1rem; }
+  main { width: min(100%, 760px); }
+  h1 { margin: 0; font-size: clamp(2rem, 7vw, 3.4rem); line-height: 1; letter-spacing: -.05em; }
+  p { margin: .45rem 0 .8rem; }
+  header, .controls, .stats { display: flex; align-items: center; justify-content: space-between; gap: .65rem; }
+  header { margin-bottom: .9rem; }
+  button { color: inherit; background: #233951; border: 1px solid #456078; border-radius: .6rem; padding: .7rem 1rem; font: inherit; font-weight: 650; cursor: pointer; }
+  button:focus-visible { outline: 3px solid white; outline-offset: 3px; }
+  button:disabled { opacity: .6; cursor: default; }
+  canvas { display:block; width:100%; height:auto; background:#10263d; border-radius:1rem; }
+  .stats { font: bold 1rem/1.5 ui-monospace, monospace; margin: .5rem 0; }
+  .controls button { touch-action: none; user-select: none; -webkit-user-select: none; width: 50%; min-height: 3rem; color: #081523; }
+  #left { background:#83dbc8; } #right { background:#ffbf81; }
+  .controls button[aria-pressed=true] { background:#fff; transform:translateY(2px); }
+  #message { min-height:1.5em; }
+</style>
+<main>
+  <header><h1>Night Shift</h1><button type="button" id="start">Start shift</button></header>
+  <p>Keep the freight platform level for 30 seconds. Hold your button to lift your end when a crate lands. Release as it clears.</p>
+  <canvas id="dock" width="760" height="330" aria-label="A dock platform with incoming crates. The tilt is written below."></canvas>
+  <div class="stats"><span id="time">30.0 s</span><output id="tilt">Level</output></div>
+  <div class="controls" aria-label="Two player controls">
+    <button type="button" id="left" aria-pressed="false">A · Lift left</button>
+    <button type="button" id="right" aria-pressed="false">L · Lift right</button>
+  </div>
+  <p id="message" role="status">Two players, one keyboard or touchscreen.</p>
+</main>
+<script>
+"use strict";
+const canvas = document.querySelector("#dock");
+const ctx = canvas.getContext("2d");
+const timeLabel = document.querySelector("#time");
+const tiltLabel = document.querySelector("#tilt");
+const message = document.querySelector("#message");
+const start = document.querySelector("#start");
+const buttons = [document.querySelector("#left"), document.querySelector("#right")];
+const wheel = ["#83dbc8", "#ffbf81"];
+const keys = ["KeyA", "KeyL"];
+const inputs = [new Set(), new Set()];
+const latched = [false, false];
+const duration = 30;
+const pivot = {x:380, y:220};
+const timestep = 1 / 120;
+let state = "ready", elapsed = 0, angle = 0, velocity = 0, danger = 0;
+let lastFrame, accumulator = 0, crates = [], nextDrop = 0, sequence = 0;
+
+function pressed(side) { return inputs[side].size > 0 && !latched[side]; }
+function input(side, source, down) {
+  if (down) inputs[side].add(source);
+  else inputs[side].delete(source);
+  if (!inputs[side].size) latched[side] = false;
+  buttons[side].setAttribute("aria-pressed", String(pressed(side)));
+}
+for (const event of ["keydown","keyup"]) {
+  window.addEventListener(event, e => {
+    const side = keys.indexOf(e.code);
+    if (side < 0 || e.altKey || e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    input(side, "key", event === "keydown");
+  });
+}
+buttons.forEach((button, side) => {
+  button.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    button.setPointerCapture(e.pointerId);
+    input(side, e.pointerId, true);
+  });
+  for (const event of ["pointerup","pointercancel","lostpointercapture"]) {
+    button.addEventListener(event, e => input(side, e.pointerId, false));
+  }
+});
+function releaseAll() {
+  buttons.forEach((button, side) => {
+    inputs[side].clear();
+    latched[side] = false;
+    button.setAttribute("aria-pressed","false");
+  });
+  lastFrame = undefined;
+}
+window.addEventListener("blur", releaseAll);
+document.addEventListener("visibilitychange", releaseAll);
+
+function newShift() {
+  state = "playing"; elapsed = angle = velocity = danger = accumulator = nextDrop = sequence = 0;
+  crates = []; lastFrame = undefined;
+  buttons.forEach((button, side) => {
+    latched[side] = inputs[side].size > 0;
+    button.setAttribute("aria-pressed","false");
+  });
+  start.disabled = true;
+  message.textContent = "Watch where each crate will land. Lift the low end before the warning fills.";
+  sync();
+}
+start.addEventListener("click", newShift);
+function finish(won) {
+  state = won ? "won" : "lost";
+  start.disabled = false; start.textContent = "Play again";
+  message.textContent = won ? "Shift complete. Both ends are safe!" : "Load tipped. Try lifting the low end when a crate lands.";
+}
+function tick(dt) {
+  if (state !== "playing") return;
+  elapsed = Math.min(duration, elapsed + dt);
+  if (elapsed >= nextDrop) {
+    // The same alternating load schedule lets a pair compare rematches.
+    const positions = [-.86, .8, -.68, .94, -.91, .7, -.78, .86];
+    crates.push({x: positions[sequence % positions.length], start: elapsed});
+    sequence++;
+    nextDrop = elapsed + 3.35 - 1.3 * elapsed / duration;
+  }
+  crates = crates.filter(crate => elapsed - crate.start < 4);
+  const load = crates.reduce((sum, crate) => sum + (elapsed - crate.start >= .9 ? crate.x : 0), 0);
+  const lift = Number(pressed(0)) - Number(pressed(1));
+  velocity += (1.65 * load + 1.7 * lift - 2.65 * angle - 2.1 * velocity) * dt;
+  angle += velocity * dt;
+  danger = Math.abs(angle) > .31 ? danger + dt : Math.max(0, danger - 2 * dt);
+  if (danger >= .85) finish(false);
+  else if (elapsed >= duration) finish(true);
+}
+function sync() {
+  timeLabel.textContent = (duration - elapsed).toFixed(1) + " s";
+  const degrees = Math.round(angle * 180 / Math.PI);
+  tiltLabel.value = Math.abs(degrees) <= 1 ? "Level" : (degrees < 0 ? "Left low " : "Right low ") + Math.abs(degrees) + "°";
+}
+function line(x1,y1,x2,y2,color,width) {
+  ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+}
+function draw() {
+  const night = ctx.createLinearGradient(0,0,0,330);
+  night.addColorStop(0,"#12233c"); night.addColorStop(1,"#214356");
+  ctx.fillStyle = night; ctx.fillRect(0,0,760,330);
+  ctx.fillStyle = "#ffe8b0"; ctx.beginPath(); ctx.arc(654,56,22,0,2*Math.PI); ctx.fill();
+  for (let i=0;i<28;i++) {
+    ctx.fillStyle = "#7992a4"; ctx.fillRect((i*137)%755,(i*49)%110+12,2,2);
+  }
+  ctx.fillStyle = "#152d40";
+  for (let i=0;i<17;i++) {
+    const h = 16+(i*47)%55;
+    ctx.fillRect(i*48,266-h,37,h);
+  }
+  ctx.fillStyle="#0c2031"; ctx.fillRect(0,266,760,64);
+  for (let i=0;i<27;i++) {
+    const x=(i*119+elapsed*3)%760;
+    line(x,276+(i*11)%45,x+16+(i%3)*8,276+(i*11)%45,"#234558",2);
+  }
+  ctx.fillStyle="#75909c"; ctx.beginPath(); ctx.moveTo(355,267); ctx.lineTo(pivot.x,217); ctx.lineTo(405,267); ctx.fill();
+  ctx.save(); ctx.translate(pivot.x,pivot.y); ctx.rotate(angle);
+  line(-258,0,0,0,wheel[0],10); line(0,0,258,0,wheel[1],10);
+  for (const crate of crates) {
+    const x=crate.x*242;
+    const age=elapsed-crate.start;
+    const y=-36-170*(1-Math.min(1,age/.9)**2);
+    if (age<.9) {
+      ctx.setLineDash([3,6]); line(x,y+31,x,-5,"#a2b0ba",1.5); ctx.setLineDash([]);
+    }
+    ctx.globalAlpha=age>3.6 ? Math.max(.3,(4-age)/.4) : 1;
+    ctx.fillStyle="#e6ad68"; ctx.fillRect(x-16,y,32,31);
+    ctx.strokeStyle="#67432e"; ctx.lineWidth=2; ctx.strokeRect(x-14,y+2,28,27);
+    line(x-13,y+3,x+13,y+28,"#87512e",2); line(x+13,y+3,x-13,y+28,"#87512e",2);
+    ctx.globalAlpha=1;
+  }
+  ctx.restore();
+  ctx.fillStyle="#dce7e7"; ctx.beginPath(); ctx.arc(pivot.x,pivot.y,5,0,2*Math.PI); ctx.fill();
+  if (danger) {
+    ctx.fillStyle="#592e36"; ctx.fillRect(272,22,216,8);
+    ctx.fillStyle="#ff905f"; ctx.fillRect(272,22,216*Math.min(1,danger/.85),8);
+  }
+}
+function frame(now) {
+  if (!document.hidden && lastFrame !== undefined && state === "playing") {
+    accumulator += Math.min(.1,(now-lastFrame)/1000);
+    while (accumulator >= timestep) { tick(timestep); accumulator -= timestep; }
+    sync();
+  }
+  lastFrame = now;
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</html>
